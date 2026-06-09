@@ -1,51 +1,183 @@
-import random
 from fastmcp import FastMCP
+import os
+import aiosqlite  
+import tempfile
 
-# Initialize FastMCP Server
-mcp = FastMCP("Remote MCP Server")
+TEMP_DIR = tempfile.gettempdir()
+DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
+CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-# 1. Tool to add two numbers
+print(f"Database path: {DB_PATH}")
+
+mcp = FastMCP("ExpenseTracker")
+
+def init_db():  
+    try:
+        
+        import sqlite3
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS expenses(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    subcategory TEXT DEFAULT '',
+                    note TEXT DEFAULT ''
+                )
+            """)
+
+            c.execute("INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
+            c.execute("DELETE FROM expenses WHERE category = 'test'")
+            print("Database initialized successfully with write access")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        raise
+
+# Initialize database synchronously at module load
+init_db()
+
 @mcp.tool()
-def add_two_numbers(a: float, b: float) -> float:
-    """
-    Add two numbers together.
+async def add_expense(date, amount, category, subcategory="", note=""):  # Changed: added async
+    '''Add a new expense entry to the database.'''
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
+            cur = await c.execute(  # Changed: added await
+                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
+                (date, amount, category, subcategory, note)
+            )
+            expense_id = cur.lastrowid
+            await c.commit()  # Changed: added await
+            return {"status": "success", "id": expense_id, "message": "Expense added successfully"}
+    except Exception as e:  # Changed: simplified exception handling
+        if "readonly" in str(e).lower():
+            return {"status": "error", "message": "Database is in read-only mode. Check file permissions."}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
     
-    Args:
-        a: The first number.
-        b: The second number.
-    
-    Returns:
-        The sum of the two numbers.
-    """
-    return a + b
-
-# 2. Tool to generate a random number between 1 and 100
 @mcp.tool()
-def generate_random_number() -> int:
-    """
-    Generate a random integer between 1 and 100 (inclusive).
-    
-    Returns:
-        A random integer between 1 and 100.
-    """
-    return random.randint(1, 100)
+async def list_expenses(start_date, end_date):  # Changed: added async
+    '''List expense entries within an inclusive date range.'''
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
+            cur = await c.execute(  # Changed: added await
+                """
+                SELECT id, date, amount, category, subcategory, note
+                FROM expenses
+                WHERE date BETWEEN ? AND ?
+                ORDER BY date DESC, id DESC
+                """,
+                (start_date, end_date)
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
+    except Exception as e:
+        return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
 
-# 3. Resource to expose server_info
-@mcp.resource("info://server_info")
-def get_server_info() -> str:
-    """
-    Retrieve server metadata and configuration details.
-    
-    Returns:
-        A string containing info about the server.
-    """
-    return (
-        "Server Name: Remote MCP Server\n"
-        "Version: 0.1.0\n"
-        "Capabilities: Tools (add_two_numbers, generate_random_number), Resources (info://server_info)\n"
-        "Status: Running\n"
-        "Transport support: stdio, sse"
-    )
+@mcp.tool()
+async def summarize(start_date, end_date, category=None):  # Changed: added async
+    '''Summarize expenses by category within an inclusive date range.'''
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
+            query = """
+                SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
+                FROM expenses
+                WHERE date BETWEEN ? AND ?
+            """
+            params = [start_date, end_date]
 
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+
+            query += " GROUP BY category ORDER BY total_amount DESC"
+
+            cur = await c.execute(query, params)  # Changed: added await
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
+    except Exception as e:
+        return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
+
+@mcp.resource("expense:///categories", mime_type="application/json")  # Changed: expense:// → expense:///
+def categories():
+    try:
+        # Provide default categories if file doesn't exist
+        default_categories = {
+            "categories": [
+                "Food & Dining",
+                "Transportation",
+                "Shopping",
+                "Entertainment",
+                "Bills & Utilities",
+                "Healthcare",
+                "Travel",
+                "Education",
+                "Business",
+                "Other"
+            ]
+        }
+        
+        try:
+            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            import json
+            return json.dumps(default_categories, indent=2)
+    except Exception as e:
+        return f'{{"error": "Could not load categories: {str(e)}"}}'
+
+@mcp.tool()
+async def edit_expense(expense_id: int, date: str = None, amount: float = None, category: str = None, subcategory: str = None, note: str = None):
+    '''Edit an existing expense entry in the database. Only provided fields will be updated.'''
+    updates = []
+    params = []
+    if date is not None:
+        updates.append("date = ?")
+        params.append(date)
+    if amount is not None:
+        updates.append("amount = ?")
+        params.append(amount)
+    if category is not None:
+        updates.append("category = ?")
+        params.append(category)
+    if subcategory is not None:
+        updates.append("subcategory = ?")
+        params.append(subcategory)
+    if note is not None:
+        updates.append("note = ?")
+        params.append(note)
+    
+    if not updates:
+        return {"status": "error", "message": "No fields provided to update."}
+        
+    params.append(expense_id)
+    sql = f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?"
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(sql, params)
+            if cur.rowcount == 0:
+                return {"status": "error", "message": f"Expense with ID {expense_id} not found."}
+            await c.commit()
+            return {"status": "ok", "message": f"Expense {expense_id} updated successfully."}
+    except Exception as e:
+        return {"status": "error", "message": f"Database error: {str(e)}"}
+
+@mcp.tool()
+async def delete_expense(expense_id: int):
+    '''Delete an expense entry from the database by its ID.'''
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+            if cur.rowcount == 0:
+                return {"status": "error", "message": f"Expense with ID {expense_id} not found."}
+            await c.commit()
+            return {"status": "ok", "message": f"Expense {expense_id} deleted successfully."}
+    except Exception as e:
+        return {"status": "error", "message": f"Database error: {str(e)}"}
+
+# Start the server
 if __name__ == "__main__":
-    mcp.run(transport="http",host="0.0.0.0",port=8000)
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
+
+    # mcp.run()
